@@ -1,0 +1,46 @@
+name: Evals
+
+on:
+  # Only when something that changes the AI feature's answers changes.
+  pull_request:
+    paths:
+      - "src/triage/**"
+      - "evals/**"
+      - "package.json"
+      - "package-lock.json"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write # to post the scorecard on the pull request
+
+concurrency:
+  group: evals-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  evals:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+
+      - name: Run the evals
+        run: npm run eval -- --markdown scorecard.md
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+
+      - name: Post the scorecard
+        if: always() && hashFiles('scorecard.md') != ''
+        run: |
+          cat scorecard.md >> "$GITHUB_STEP_SUMMARY"
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            gh pr comment ${{ github.event.pull_request.number }} --repo ${{ github.repository }} --body-file scorecard.md
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}

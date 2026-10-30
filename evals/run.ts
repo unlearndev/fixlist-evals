@@ -6,6 +6,7 @@
 //   npm run eval -- --null            grade a triage that always says "other, routine" (no API calls)
 //   npm run eval -- --no-judge         code graders only, no model grader
 //   npm run eval -- --only T-1013,T-1019
+//   npm run eval -- --markdown scorecard.md   also write the scorecard as Markdown (CI posts it)
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { parseArgs } from "node:util";
 import { loadProperties, readJsonl } from "../server/data.ts";
@@ -30,6 +31,7 @@ const { values: args } = parseArgs({
     null: { type: "boolean", default: false },
     only: { type: "string" },
     judge: { type: "boolean", default: true },
+    markdown: { type: "string" },
   },
   allowNegative: true,
 });
@@ -100,7 +102,8 @@ const attempts = await pool(jobs, "runs", ({ c, rep }) => attempt(c, rep));
 // an API error says nothing about the feature, so it's reported on its own.
 
 type Row = { label: string; passed: number; total: number; threshold: number };
-const failures: { line: string; critical: boolean }[] = [];
+type Failure = { id: string; check: string; detail: string; critical: boolean };
+const failures: Failure[] = [];
 const rows: Row[] = [];
 const errors = attempts.filter((a) => a.error);
 
@@ -123,7 +126,7 @@ for (const grader of graders) {
     }
     const times = runs.length > 1 ? ` in ${failed.length} of ${runs.length} runs` : "";
     const critical = grader.name === "urgency" && c.expected.urgency === "emergency";
-    failures.push({ line: `  ${c.id}  ${grader.label.padEnd(20)} ${failed[0].detail}${times}${critical ? "   CRITICAL" : ""}`, critical });
+    failures.push({ id: c.id, check: grader.label, detail: `${failed[0].detail}${times}`, critical });
   }
   rows.push({ label: grader.label, passed, total: graded.length, threshold: thresholds[grader.name] ?? 1 });
 }
@@ -149,8 +152,7 @@ if (useJudge) {
       total++;
       if (verdict.pass) passed++;
       else {
-        const reason = verdict.reason.length > 60 ? verdict.reason.slice(0, 57) + "..." : verdict.reason;
-        failures.push({ line: `  ${c.id}  ${`Summary: ${criterion.id}`.padEnd(20)} ${reason}`, critical: false });
+        failures.push({ id: c.id, check: `Summary: ${criterion.id}`, detail: verdict.reason, critical: false });
       }
     }
     rows.push({ label: `Summary: ${criterion.id}`, passed, total, threshold: thresholds[criterion.id] ?? thresholds.summary ?? 1 });
@@ -161,13 +163,17 @@ const seconds = (performance.now() - started) / 1000;
 // --- report ----------------------------------------------------------------------------
 
 const pct = (n: number, d: number) => (d === 0 ? "-" : `${Math.round((n / d) * 100)}%`);
+const cut = (text: string, max: number) => (text.length > max ? text.slice(0, max - 3) + "..." : text);
+const sorted = failures.sort((a, b) => Number(b.critical) - Number(a.critical) || a.id.localeCompare(b.id) || a.check.localeCompare(b.check));
 const needs = (t: number) => (t === 1 ? "needs 100%" : `needs ${Math.round(t * 100)}%`);
 
-if (failures.length === 0) console.log("Failures: none\n");
+if (sorted.length === 0) console.log("Failures: none\n");
 else {
-  const sorted = failures.sort((a, b) => Number(b.critical) - Number(a.critical) || a.line.localeCompare(b.line));
+  const lines = sorted
+    .slice(0, SHOW_FAILURES)
+    .map((f) => `  ${f.id}  ${f.check.padEnd(21)} ${cut(f.detail, 62)}${f.critical ? "   CRITICAL" : ""}`);
   const more = sorted.length > SHOW_FAILURES ? `\n  ...and ${sorted.length - SHOW_FAILURES} more in evals/results/latest.json` : "";
-  console.log(`Failures\n${sorted.slice(0, SHOW_FAILURES).map((f) => f.line).join("\n")}${more}\n`);
+  console.log(`Failures\n${lines.join("\n")}${more}\n`);
 }
 console.log("Scores");
 let belowThreshold = 0;
@@ -180,7 +186,7 @@ for (const row of rows) {
 }
 
 const allErrors = [...errors.map((e) => ({ id: e.id, error: e.error! })), ...judgeErrors];
-console.log(allErrors.length ? `\nErrors (not graded)\n${allErrors.map((e) => `  ${e.id}  ${e.error}`).join("\n")}` : "\nErrors: none");
+console.log(allErrors.length ? `\nErrors (not graded)\n${allErrors.map((e) => `  ${e.id}  ${cut(e.error, 80)}`).join("\n")}` : "\nErrors: none");
 
 type Usage = { input_tokens: number; output_tokens: number };
 const add = (list: (Usage | undefined)[]) =>
@@ -189,16 +195,37 @@ const add = (list: (Usage | undefined)[]) =>
     { input_tokens: 0, output_tokens: 0 },
   );
 const usage = add(attempts.map((a) => a.usage));
+const fresh = [...judgements.values()].filter((j) => !j.cached);
+const dollars = (n: number) => (Number.isNaN(n) ? "cost unknown" : `$${n.toFixed(2)}`);
+const featureCost = cost(args.model!, usage);
+const judgeCost = cost(JUDGE_MODEL, add(fresh.map((j) => j.usage)));
 if (!args.oracle && !args.null) {
-  const fresh = [...judgements.values()].filter((j) => !j.cached);
-  const featureCost = cost(args.model!, usage);
-  const judgeCost = cost(JUDGE_MODEL, add(fresh.map((j) => j.usage)));
-  const dollars = (n: number) => (Number.isNaN(n) ? "cost unknown" : `$${n.toFixed(2)}`);
   console.log(
     `Feature: ${attempts.length} calls · ${usage.input_tokens.toLocaleString("en-GB")} tokens in · ${usage.output_tokens.toLocaleString("en-GB")} out · ${dollars(featureCost)}`,
   );
   if (useJudge) console.log(`Judge: ${judgements.size} summaries (${judgements.size - fresh.length} cached) · ${dollars(judgeCost)}`);
-  console.log(`${Math.round(seconds)}s`);
+  console.log(`Took ${Math.round(seconds)}s`);
+}
+
+if (args.markdown) {
+  const verdict = allErrors.length ? "couldn't grade every case" : belowThreshold ? "failed" : "passed";
+  const md = [
+    `## Triage evals: ${verdict}`,
+    "",
+    `${mode} · prompt ${PROMPT_VERSION} · ${cases.length} cases · ${jobs.length} runs`,
+    "",
+    "| Check | Score | Needs | |",
+    "|---|---|---|---|",
+    ...rows.map((r) => `| ${r.label} | ${r.passed} of ${r.total} (${pct(r.passed, r.total)}) | ${Math.round(r.threshold * 100)}% | ${r.total > 0 && r.passed / r.total >= r.threshold ? "ok" : "**FAIL**"} |`),
+    "",
+    sorted.length ? "**Failures**\n" : "No failures.",
+    ...sorted.map((f) => `- \`${f.id}\` ${f.check}: ${f.detail}${f.critical ? " **(critical)**" : ""}`),
+    ...(allErrors.length ? ["", "**Errors (not graded)**", "", ...allErrors.map((e) => `- \`${e.id}\` ${cut(e.error, 120)}`)] : []),
+    "",
+    `Feature ${dollars(featureCost)} · judge ${dollars(judgeCost)} · ${Math.round(seconds)}s`,
+    "",
+  ].join("\n");
+  writeFileSync(args.markdown, md);
 }
 
 mkdirSync(new URL("results/", import.meta.url), { recursive: true });
