@@ -4,6 +4,7 @@
 //   npm run eval -- --model <id>      the same cases on another model
 //   npm run eval -- --oracle          grade the expected answers (no API calls): should score 100%
 //   npm run eval -- --null            grade a triage that always says "other, routine" (no API calls)
+//   npm run eval -- --no-judge         code graders only, no model grader
 //   npm run eval -- --only T-1013,T-1019
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { parseArgs } from "node:util";
@@ -13,7 +14,9 @@ import { PROMPT_VERSION } from "../src/triage/prompt.ts";
 import type { Triage } from "../src/triage/schema.ts";
 import { triage } from "../src/triage/triage.ts";
 import { graders } from "./graders.ts";
+import { JUDGE_MODEL, judge, type Judgement } from "./judge.ts";
 import { cost } from "./prices.ts";
+import { RUBRIC } from "./rubric.ts";
 import type { Case } from "./types.ts";
 
 const EMERGENCY_REPS = 3; // an emergency has to come out as an emergency every time
@@ -26,7 +29,9 @@ const { values: args } = parseArgs({
     oracle: { type: "boolean", default: false },
     null: { type: "boolean", default: false },
     only: { type: "string" },
+    judge: { type: "boolean", default: true },
   },
+  allowNegative: true,
 });
 
 type Attempt = {
@@ -72,20 +77,23 @@ async function attempt(c: Case, rep: number): Promise<Attempt> {
   }
 }
 
+async function pool<T, R>(items: T[], label: string, work: (item: T) => Promise<R>): Promise<R[]> {
+  const results: R[] = [];
+  let next = 0;
+  await Promise.all(
+    Array.from({ length: Math.min(CONCURRENCY, items.length) }, async () => {
+      while (next < items.length) {
+        results.push(await work(items[next++]));
+        if (process.stdout.isTTY) process.stdout.write(`\r  ${results.length} of ${items.length} ${label}`);
+      }
+    }),
+  );
+  if (process.stdout.isTTY) process.stdout.write("\r" + " ".repeat(40) + "\r");
+  return results;
+}
+
 const started = performance.now();
-const attempts: Attempt[] = [];
-let next = 0;
-await Promise.all(
-  Array.from({ length: Math.min(CONCURRENCY, jobs.length) }, async () => {
-    while (next < jobs.length) {
-      const { c, rep } = jobs[next++];
-      attempts.push(await attempt(c, rep));
-      if (process.stdout.isTTY) process.stdout.write(`\r  ${attempts.length} of ${jobs.length} runs`);
-    }
-  }),
-);
-if (process.stdout.isTTY) process.stdout.write("\r" + " ".repeat(30) + "\r");
-const seconds = (performance.now() - started) / 1000;
+const attempts = await pool(jobs, "runs", ({ c, rep }) => attempt(c, rep));
 
 // --- grade every answer ------------------------------------------------------------------
 // A case passes a grader only if every run of it passes. Runs that errored aren't graded:
@@ -120,6 +128,36 @@ for (const grader of graders) {
   rows.push({ label: grader.label, passed, total: graded.length, threshold: thresholds[grader.name] ?? 1 });
 }
 
+// The model grader checks what code can't: one call per case, on the first run's summary.
+const useJudge = args.judge && !args.oracle && !args.null;
+const judgements = new Map<string, Judgement>();
+const judgeErrors: { id: string; error: string }[] = [];
+if (useJudge) {
+  await pool(graded, "summaries judged", async ({ c, runs }) => {
+    try {
+      judgements.set(c.id, await judge(c.report, runs[0].output!.summary, RUBRIC));
+    } catch (error) {
+      judgeErrors.push({ id: c.id, error: `judge: ${error instanceof Error ? error.message : String(error)}` });
+    }
+  });
+  for (const criterion of RUBRIC) {
+    let passed = 0;
+    let total = 0;
+    for (const { c } of graded) {
+      const verdict = judgements.get(c.id)?.verdicts[criterion.id];
+      if (!verdict) continue;
+      total++;
+      if (verdict.pass) passed++;
+      else {
+        const reason = verdict.reason.length > 60 ? verdict.reason.slice(0, 57) + "..." : verdict.reason;
+        failures.push({ line: `  ${c.id}  ${`Summary: ${criterion.id}`.padEnd(20)} ${reason}`, critical: false });
+      }
+    }
+    rows.push({ label: `Summary: ${criterion.id}`, passed, total, threshold: thresholds[criterion.id] ?? thresholds.summary ?? 1 });
+  }
+}
+const seconds = (performance.now() - started) / 1000;
+
 // --- report ----------------------------------------------------------------------------
 
 const pct = (n: number, d: number) => (d === 0 ? "-" : `${Math.round((n / d) * 100)}%`);
@@ -141,23 +179,36 @@ for (const row of rows) {
   );
 }
 
-console.log(errors.length ? `\nErrors (not graded)\n${errors.map((e) => `  ${e.id}  ${e.error}`).join("\n")}` : "\nErrors: none");
+const allErrors = [...errors.map((e) => ({ id: e.id, error: e.error! })), ...judgeErrors];
+console.log(allErrors.length ? `\nErrors (not graded)\n${allErrors.map((e) => `  ${e.id}  ${e.error}`).join("\n")}` : "\nErrors: none");
 
-const usage = attempts.reduce(
-  (sum, a) => ({ input_tokens: sum.input_tokens + (a.usage?.input_tokens ?? 0), output_tokens: sum.output_tokens + (a.usage?.output_tokens ?? 0) }),
-  { input_tokens: 0, output_tokens: 0 },
-);
-if (!args.oracle && !args.null) {
-  const dollars = cost(args.model!, usage);
-  console.log(
-    `${attempts.length} calls · ${usage.input_tokens.toLocaleString("en-GB")} tokens in · ${usage.output_tokens.toLocaleString("en-GB")} out · ${Number.isNaN(dollars) ? "cost unknown" : `$${dollars.toFixed(2)}`} · ${Math.round(seconds)}s`,
+type Usage = { input_tokens: number; output_tokens: number };
+const add = (list: (Usage | undefined)[]) =>
+  list.reduce<Usage>(
+    (sum, u) => ({ input_tokens: sum.input_tokens + (u?.input_tokens ?? 0), output_tokens: sum.output_tokens + (u?.output_tokens ?? 0) }),
+    { input_tokens: 0, output_tokens: 0 },
   );
+const usage = add(attempts.map((a) => a.usage));
+if (!args.oracle && !args.null) {
+  const fresh = [...judgements.values()].filter((j) => !j.cached);
+  const featureCost = cost(args.model!, usage);
+  const judgeCost = cost(JUDGE_MODEL, add(fresh.map((j) => j.usage)));
+  const dollars = (n: number) => (Number.isNaN(n) ? "cost unknown" : `$${n.toFixed(2)}`);
+  console.log(
+    `Feature: ${attempts.length} calls · ${usage.input_tokens.toLocaleString("en-GB")} tokens in · ${usage.output_tokens.toLocaleString("en-GB")} out · ${dollars(featureCost)}`,
+  );
+  if (useJudge) console.log(`Judge: ${judgements.size} summaries (${judgements.size - fresh.length} cached) · ${dollars(judgeCost)}`);
+  console.log(`${Math.round(seconds)}s`);
 }
 
 mkdirSync(new URL("results/", import.meta.url), { recursive: true });
 writeFileSync(
   new URL("results/latest.json", import.meta.url),
-  JSON.stringify({ mode, promptVersion: PROMPT_VERSION, ranAt: new Date().toISOString(), rows, attempts }, null, 2),
+  JSON.stringify(
+    { mode, promptVersion: PROMPT_VERSION, ranAt: new Date().toISOString(), rows, attempts, judgements: Object.fromEntries(judgements) },
+    null,
+    2,
+  ),
 );
 
-process.exitCode = errors.length > 0 ? 2 : belowThreshold > 0 ? 1 : 0;
+process.exitCode = allErrors.length > 0 ? 2 : belowThreshold > 0 ? 1 : 0;

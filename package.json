@@ -12,7 +12,8 @@
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "triage": "node scripts/triage.ts",
-    "eval": "node evals/run.ts"
+    "eval": "node evals/run.ts",
+    "judge:check": "node evals/judge-check.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "1.3.0"

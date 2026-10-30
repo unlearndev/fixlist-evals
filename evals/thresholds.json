@@ -1,5 +1,6 @@
 {
   "emergencies": 1.0,
   "urgency": 0.85,
-  "category": 0.85
+  "category": 0.85,
+  "summary": 0.9
 }
