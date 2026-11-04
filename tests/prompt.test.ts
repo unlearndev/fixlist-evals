@@ -30,6 +30,15 @@ describe("buildUserMessage", () => {
     expect(message).toContain("Report (phone call, typed up by staff)");
   });
 
+  it("includes the property record the urgency policy depends on", () => {
+    const message = buildUserMessage(
+      { text: "The toilet won't flush.", channel: "email", receivedAt: "2026-10-01T09:00:00Z" },
+      { ...property, vulnerableTenant: true, vulnerableNote: "elderly tenant" },
+    );
+    expect(message).toContain("- Toilets: 1");
+    expect(message).toContain("- Vulnerable tenant: yes (elderly tenant)");
+  });
+
   it("never sends the tenant's contact details", () => {
     const message = buildUserMessage(
       { text: "No hot water.", channel: "form", receivedAt: "2026-10-01T09:00:00Z" },
